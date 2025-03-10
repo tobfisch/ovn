@@ -1524,6 +1524,15 @@ is_binding_lport_this_chassis(struct binding_lport *b_lport,
              || is_postponed_port(b_lport->pb->logical_port)));
 }
 
+static bool
+is_binding_lport_this_as_main_chassis(struct binding_lport *b_lport,
+                              const struct sbrec_chassis *chassis)
+{
+    return (b_lport && b_lport->pb && chassis &&
+            (b_lport->pb->chassis == chassis
+             || is_postponed_port(b_lport->pb->logical_port)));
+}
+
 /* Returns 'true' if the 'lbinding' has binding lports of type LP_CONTAINER,
  * 'false' otherwise. */
 static bool
@@ -1820,7 +1829,7 @@ consider_virtual_lport(const struct sbrec_port_binding *pb,
         }
 
         parent_b_lport = local_binding_get_primary_lport(parent_lbinding);
-        if (is_binding_lport_this_chassis(parent_b_lport,
+        if (is_binding_lport_this_as_main_chassis(parent_b_lport,
                                           b_ctx_in->chassis_rec)) {
             virtual_b_lport =
                 local_binding_add_lport(binding_lports, parent_lbinding, pb,
