@@ -104,6 +104,7 @@ static unixctl_cb_func debug_pause_execution;
 static unixctl_cb_func debug_resume_execution;
 static unixctl_cb_func debug_status_execution;
 static unixctl_cb_func debug_dump_local_bindings;
+static unixctl_cb_func debug_dump_local_datapaths;
 static unixctl_cb_func debug_dump_related_lports;
 static unixctl_cb_func debug_dump_local_template_vars;
 static unixctl_cb_func debug_dump_local_mac_bindings;
@@ -882,6 +883,20 @@ get_transport_zones(const struct ovsrec_open_vswitch_table *ovs_table)
     const char *chassis_id = get_ovs_chassis_id(ovs_table);
     return get_chassis_external_id_value(&cfg->external_ids, chassis_id,
                                          "ovn-transport-zones", "");
+}
+
+static bool
+get_ovn_cleanup_on_exit(const struct ovsrec_open_vswitch_table *ovs_table)
+{
+    const struct ovsrec_open_vswitch *cfg =
+        ovsrec_open_vswitch_table_first(ovs_table);
+    const char *chassis_id = get_ovs_chassis_id(ovs_table);
+    if (!cfg || !chassis_id) {
+        return false;
+    }
+
+    return get_chassis_external_id_value_bool(&cfg->external_ids, chassis_id,
+                                              "ovn-cleanup-on-exit", true);
 }
 
 static void
@@ -2755,15 +2770,15 @@ lb_data_local_lb_remove(struct ed_type_lb_data *lb_data,
 
 static bool
 lb_data_handle_changed_ref(enum objdep_type type, const char *res_name,
-                           struct ovs_list *objs_todo, const void *in_arg,
+                           struct uuidset *objs_todo, const void *in_arg,
                            void *out_arg)
 {
     const struct lb_data_ctx_in *ctx_in = in_arg;
     struct ed_type_lb_data *lb_data = out_arg;
 
-    struct object_to_resources_list_node *resource_lb_uuid;
-    LIST_FOR_EACH_POP (resource_lb_uuid, list_node, objs_todo) {
-        struct uuid *uuid = &resource_lb_uuid->obj_uuid;
+    struct uuidset_node *ofrn;
+    UUIDSET_FOR_EACH (ofrn, objs_todo) {
+        struct uuid *uuid = &ofrn->uuid;
 
         VLOG_DBG("Reprocess LB "UUID_FMT" for resource type: %s, name: %s",
                  UUID_ARGS(uuid), objdep_type_name(type), res_name);
@@ -2771,7 +2786,6 @@ lb_data_handle_changed_ref(enum objdep_type type, const char *res_name,
         struct ovn_controller_lb *lb =
             ovn_controller_lb_find(&lb_data->local_lbs, uuid);
         if (!lb) {
-            free(resource_lb_uuid);
             continue;
         }
 
@@ -2780,14 +2794,13 @@ lb_data_handle_changed_ref(enum objdep_type type, const char *res_name,
         const struct sbrec_load_balancer *sbrec_lb =
             sbrec_load_balancer_table_get_for_uuid(ctx_in->lb_table, uuid);
         if (!lb_is_local(sbrec_lb, ctx_in->local_datapaths)) {
-            free(resource_lb_uuid);
             continue;
         }
 
         lb_data_local_lb_add(lb_data, sbrec_lb, ctx_in->template_vars, true);
-
-        free(resource_lb_uuid);
     }
+
+    uuidset_destroy(objs_todo);
     return true;
 }
 
@@ -2861,11 +2874,9 @@ lb_data_sb_load_balancer_handler(struct engine_node *node, void *data)
         if (!sbrec_load_balancer_is_new(sbrec_lb)) {
             lb = ovn_controller_lb_find(&lb_data->local_lbs,
                                         &sbrec_lb->header_.uuid);
-            if (!lb) {
-                continue;
+            if (lb) {
+                lb_data_local_lb_remove(lb_data, lb);
             }
-
-            lb_data_local_lb_remove(lb_data, lb);
         }
 
         if (sbrec_load_balancer_is_deleted(sbrec_lb) ||
@@ -5954,6 +5965,10 @@ main(int argc, char *argv[])
                              debug_dump_local_bindings,
                              &runtime_data->lbinding_data);
 
+    unixctl_command_register("debug/dump-local-datapaths", "", 0, 0,
+                             debug_dump_local_datapaths,
+                             &runtime_data->local_datapaths);
+
     unixctl_command_register("debug/dump-related-ports", "", 0, 0,
                              debug_dump_related_lports,
                              &runtime_data->related_lports);
@@ -6522,8 +6537,14 @@ loop_done:
     engine_set_context(NULL);
     engine_cleanup();
 
+    const struct ovsrec_open_vswitch_table *ovs_table =
+        ovsrec_open_vswitch_table_get(ovs_idl_loop.idl);
+    bool restart = exit_args.restart || !get_ovn_cleanup_on_exit(ovs_table);
+    VLOG_INFO("Exiting ovn-controller, resource cleanup: %s",
+              restart ? "False (--restart)" : "True");
+
     /* It's time to exit.  Clean up the databases if we are not restarting */
-    if (!exit_args.restart) {
+    if (!restart) {
         bool done = !ovsdb_idl_has_ever_connected(ovnsb_idl_loop.idl);
         while (!done) {
             update_sb_db(ovs_idl_loop.idl, ovnsb_idl_loop.idl,
@@ -6537,8 +6558,6 @@ loop_done:
 
             const struct ovsrec_bridge_table *bridge_table
                 = ovsrec_bridge_table_get(ovs_idl_loop.idl);
-            const struct ovsrec_open_vswitch_table *ovs_table
-                = ovsrec_open_vswitch_table_get(ovs_idl_loop.idl);
 
             const struct sbrec_port_binding_table *port_binding_table
                 = sbrec_port_binding_table_get(ovnsb_idl_loop.idl);
@@ -6926,6 +6945,17 @@ debug_dump_local_bindings(struct unixctl_conn *conn, int argc OVS_UNUSED,
     binding_dump_local_bindings(local_bindings, &binding_data);
     unixctl_command_reply(conn, ds_cstr(&binding_data));
     ds_destroy(&binding_data);
+}
+
+static void
+debug_dump_local_datapaths(struct unixctl_conn *conn, int argc OVS_UNUSED,
+                           const char *argv[] OVS_UNUSED,
+                           void *local_datapaths)
+{
+    struct ds local_dps_data = DS_EMPTY_INITIALIZER;
+    binding_dump_local_datapaths(local_datapaths, &local_dps_data);
+    unixctl_command_reply(conn, ds_cstr(&local_dps_data));
+    ds_destroy(&local_dps_data);
 }
 
 static void

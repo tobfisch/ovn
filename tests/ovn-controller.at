@@ -766,8 +766,12 @@ primary lport : [[lsp1]]
 done
 
 check as northd ovn-appctl -t ovn-northd resume
+
+# Since northd is restarted, port type is back to localport, so ls is not local datapath anymore.
 OVN_CLEANUP([hv1
-/No distributed-port option set for chassisredirect port lsp1/d])
+/No distributed-port option set for chassisredirect port lsp1/d
+ignored_dp=ls1
+])
 AT_CLEANUP
 
 AT_SETUP([ovn-controller - ssl/tls files change when using command line options])
@@ -3757,6 +3761,63 @@ AT_CHECK_UNQUOTED([grep "cookie=$hv3_cookie," phy_to_log_flows], [0], [dnl
  cookie=$hv3_cookie, priority=120,icmp6,in_port="ovn-hv3-0",icmp_type=136,icmp_code=0 actions=load:0x1->NXM_NX_REG10[[16]],move:NXM_NX_TUN_ID[[12..23]]->NXM_NX_REG15[[0..11]],move:NXM_NX_TUN_ID[[0..11]]->OXM_OF_METADATA[[0..11]],resubmit(,OFTABLE_LOG_INGRESS_PIPELINE),resubmit(,OFTABLE_LOCAL_OUTPUT)
  cookie=$hv3_cookie, priority=120,arp,in_port="ovn-hv3-0",arp_op=2 actions=load:0x1->NXM_NX_REG10[[16]],move:NXM_NX_TUN_ID[[12..23]]->NXM_NX_REG15[[0..11]],move:NXM_NX_TUN_ID[[0..11]]->OXM_OF_METADATA[[0..11]],resubmit(,OFTABLE_LOG_INGRESS_PIPELINE),resubmit(,OFTABLE_LOCAL_OUTPUT)
 ])
+
+OVN_CLEANUP([hv1])
+AT_CLEANUP
+
+AT_SETUP([ovn-cntroller exit - Cleanup])
+ovn_start
+
+net_add n1
+sim_add hv1
+as hv1
+check ovs-vsctl add-br br-phys
+ovn_attach n1 br-phys 192.168.0.11 24 geneve,vxlan
+check ovn-nbctl --wait=hv sync
+
+start_controller() {
+    rm hv1/ovn-controller.log
+    start_daemon ovn-controller
+    check ovn-nbctl --wait=hv sync
+}
+
+# Stop ovn-controller, without any argument it will cleanup resources.
+check ovn-appctl -t ovn-controller exit
+check grep -q "Exiting ovn-controller, resource cleanup: True" hv1/ovn-controller.log
+
+# Stop ovn-controller without cleanup.
+start_controller
+check ovn-appctl -t ovn-controller exit --restart
+check grep -q "Exiting ovn-controller, resource cleanup: False (--restart)" hv1/ovn-controller.log
+
+# Set cleanup on exit.
+check ovs-vsctl set open . external-ids:ovn-cleanup-on_exit=true
+
+# Stop ovn-controller, without any argument it will cleanup resources.
+start_controller
+check ovn-appctl -t ovn-controller exit
+check grep -q "Exiting ovn-controller, resource cleanup: True" hv1/ovn-controller.log
+
+# Stop ovn-controller, --restart flag has priority over external-ids, no cleanup.
+start_controller
+check ovn-appctl -t ovn-controller exit --restart
+check grep -q "Exiting ovn-controller, resource cleanup: False (--restart)" hv1/ovn-controller.log
+
+# Set cleanup on exit to false.
+check ovs-vsctl set open . external-ids:ovn-cleanup-on-exit=false
+
+# Stop ovn-controller, without any argument it won't cleanup due to the external-ids.
+start_controller
+check ovn-appctl -t ovn-controller exit
+check grep -q "Exiting ovn-controller, resource cleanup: False (--restart)" hv1/ovn-controller.log
+
+# Stop ovn-controller without cleanup.
+start_controller
+check ovn-appctl -t ovn-controller exit --restart
+check grep -q "Exiting ovn-controller, resource cleanup: False (--restart)" hv1/ovn-controller.log
+
+# Start the controller so the test cleanup routing doesn't get stuck.
+start_controller
 
 OVN_CLEANUP([hv1])
 AT_CLEANUP
